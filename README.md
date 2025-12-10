@@ -33,6 +33,17 @@ All code is fully reproducible in R and provided in the .Rmd file.
 ⸻
 
 📁 Repository Structure
+├── LUAD_survival_pipeline.Rmd   # full analysis + narrative
+├── data/                        # expression, survival, clinical files (not included)
+├── figures/                     # automatically generated plots
+│   ├── forest_20_genes_pub.png
+│   ├── lasso_coefficients_barplot.png
+│   ├── KM_test_lasso.png
+│   ├── KM_multi_gene_score_tertiles.png
+│   ├── score_distribution.png
+│   ├── heatmap_genes20.png
+│   └── calibration_test_lasso.png
+└── README.md
 
 📊 Key Methods & Results
 
