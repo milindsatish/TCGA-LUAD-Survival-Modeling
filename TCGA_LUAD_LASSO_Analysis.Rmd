@@ -1,0 +1,329 @@
+---
+title: "TCGA LUAD — LASSO Cox Survival Analysis"
+author: "Automated analysis (editable)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE)
+```
+
+## Overview
+
+This analysis demonstrates a reproducible TCGA-LUAD survival workflow using gene expression, clinical, and survival data.  
+It includes data harmonization, univariate Cox models for a list of important LUAD genes, a LASSO-Cox prognostic model with train/test evaluation, a multi-gene prognostic score, and publication-quality figures saved to `figures/`.
+
+Place the three input files in the working directory before running:
+- `TCGALUAD.genes.gz` — gene expression matrix (genes × samples)
+- `survivalLUAD.txt` — survival table
+- `TCGALUADclinical` — clinical metadata
+
+A minimal set of packages used (install once if needed):
+```r
+# install.packages("tidyverse")
+# install.packages("data.table")
+# install.packages("survival")
+# install.packages("glmnet")
+# install.packages("survminer")
+# install.packages("pheatmap")
+# install.packages("broom")
+# if needed: BiocManager::install(c("TCGAbiolinks","SummarizedExperiment"))
+```
+
+```{r load-libs}
+library(tidyverse)
+library(data.table)
+library(survival)
+library(glmnet)
+library(survminer)
+library(pheatmap)
+library(broom)
+```
+
+## Load data and basic checks
+
+```{r read-data}
+expr <- readr::read_tsv("TCGALUAD.genes.gz")
+surv  <- readr::read_tsv("survivalLUAD.txt")
+clin  <- readr::read_tsv("TCGALUADclinical")
+
+message("Dimensions: expr=", paste(dim(expr), collapse="x"),
+        "  surv=", paste(dim(surv), collapse="x"),
+        "  clin=", paste(dim(clin), collapse="x"))
+```
+
+```{r normalize-ids}
+# Ensure the expression first column is 'gene'
+if (colnames(expr)[1] != "gene") colnames(expr)[1] <- "gene"
+
+# Standardize survival patient column: prefer `_PATIENT`, fallback to 'patient' or 'sample'
+if ("_PATIENT" %in% colnames(surv)) {
+  surv <- surv %>% rename(patient = `_PATIENT`)
+} else if ("patient" %in% colnames(surv)) {
+  surv <- surv %>% rename(patient = patient)
+} else if ("sample" %in% colnames(surv)) {
+  surv <- surv %>% mutate(patient = substr(sample, 1, 12))
+} else stop("Could not find patient column in survival file.")
+
+# Choose clinical patient-like column automatically
+clin_patient_col <- NULL
+candidates <- c("bcr_patient_barcode","patient","sampleID","sample","bcr_patient_barcode_1")
+for (c in candidates) if (c %in% colnames(clin)) clin_patient_col <- c
+if (is.null(clin_patient_col)) {
+  samplecols <- sapply(clin, function(col) any(grepl("^TCGA-\\w{2}-\\w{4}", as.character(head(col,50)))))
+  if (any(samplecols)) clin_patient_col <- names(samplecols)[which(samplecols)[1]]
+}
+if (is.null(clin_patient_col)) stop("Could not locate patient/sample column in clinical file.")
+
+clin <- clin %>%
+  mutate(patient = if_else(nchar(as.character(.data[[clin_patient_col]])) >= 12,
+                           substr(as.character(.data[[clin_patient_col]]), 1, 12),
+                           as.character(.data[[clin_patient_col]])))
+
+# Ensure survival patient is 12-char
+surv <- surv %>% mutate(patient = substr(as.character(patient), 1, 12))
+
+message("Using clinical patient column: ", clin_patient_col)
+```
+
+## Convert expression to tidy (long) format
+
+```{r expr-long}
+# Convert sample column names (barcodes) to patient ids (first 12 chars)
+sample_cols <- setdiff(colnames(expr), "gene")
+sample_patient_ids <- substr(sample_cols, 1, 12)
+colnames(expr)[colnames(expr) %in% sample_cols] <- sample_patient_ids
+
+expr_long <- expr %>%
+  pivot_longer(-gene, names_to = "patient", values_to = "expr") %>%
+  mutate(expr = as.numeric(expr))
+
+message("Tidy expression dims: ", paste(dim(expr_long), collapse="x"))
+```
+
+## Define gene sets and run univariate Cox models
+
+```{r gene-sets}
+smoking_genes <- c("TP53","KEAP1","STK11","KRAS","NF1",
+                   "SMARCA4","RBM10","SERPINB13","CUL3","ATM")
+
+nonsmoking_genes <- c("EGFR","ALK","ROS1","RET","MET",
+                      "ERBB2","BRAF","NTRK1","MAP2K1","PIK3CA")
+
+genes20 <- c(smoking_genes, nonsmoking_genes)
+```
+
+```{r univariate-cox}
+cox_results <- list()
+for (g in genes20) {
+  expr_gene <- expr_long %>% filter(gene == g)
+  df <- expr_gene %>% inner_join(surv, by="patient") %>% left_join(clin, by="patient")
+  fit <- try(coxph(Surv(OS.time, OS) ~ expr, data = df), silent = TRUE)
+  if (inherits(fit, "try-error")) next
+  res <- tidy(fit) %>% mutate(gene = g)
+  cox_results[[g]] <- res
+}
+cox_df <- bind_rows(cox_results) %>% mutate(HR = exp(estimate))
+cox_df
+```
+
+### Save a publication-style forest plot for the 20 genes
+
+```{r forest-plot, fig.width=6, fig.height=8}
+if (!dir.exists("figures")) dir.create("figures")
+plot_df <- cox_df %>%
+  mutate(group = if_else(gene %in% smoking_genes, "Smoking-associated", "Non-smoking-associated"),
+         sig = p.value < 0.05,
+         gene = factor(gene, levels = gene[order(HR)]))
+
+p_forest <- ggplot(plot_df, aes(x = HR, y = gene, color = sig)) +
+  geom_errorbarh(aes(xmin = exp(estimate - 1.96*std.error), xmax = exp(estimate + 1.96*std.error)), height = 0.25) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 1, linetype="dashed") +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  facet_grid(group ~ ., scales = "free_y", space = "free") +
+  theme_minimal(base_size = 13) +
+  labs(title = "Cox Hazard Ratios for 20 LUAD Driver Genes",
+       subtitle = "Grouped by smoking-associated vs non-smoking-associated",
+       x = "Hazard Ratio (HR)", y = "")
+
+print(p_forest)
+ggsave("figures/forest_20_genes_pub.png", p_forest, width = 6, height = 8, dpi = 300)
+```
+
+## Build patient-level wide expression matrix for the selected genes
+
+```{r build-patient-matrix}
+expr_sel <- expr_long %>%
+  filter(gene %in% genes20) %>%
+  group_by(gene, patient) %>%
+  summarise(expr = mean(expr, na.rm=TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = gene, values_from = expr)
+
+patient_df <- expr_sel %>%
+  inner_join(surv %>% select(patient, OS, OS.time), by = "patient") %>%
+  filter(!is.na(OS), !is.na(OS.time))
+
+message("Patients with expression + survival:", nrow(patient_df))
+```
+
+## LASSO-Cox model (cross-validated) and coefficient barplot
+
+```{r lasso-fit, fig.width=7, fig.height=5}
+# Prepare X and y
+genes_used <- genes20
+X <- as.matrix(patient_df %>% select(all_of(genes_used)))
+for (j in seq_len(ncol(X))) X[is.na(X[,j]), j] <- mean(X[,j], na.rm=TRUE)
+X <- scale(X)
+y_time <- patient_df$OS.time
+y_event <- patient_df$OS
+
+# Cox requires positive times
+y_time_fixed <- ifelse(y_time <= 0, 1, y_time)
+y <- Surv(y_time_fixed, y_event)
+
+set.seed(123)
+cvfit <- cv.glmnet(x = X, y = y, family = "cox", alpha = 1, nfolds = 10)
+plot(cvfit)
+
+lasso_coef <- coef(cvfit, s = "lambda.min")
+coef_df <- data.frame(gene = rownames(lasso_coef), coef = as.numeric(lasso_coef)) %>%
+  filter(coef != 0) %>%
+  arrange(coef)
+
+p_lasso <- ggplot(coef_df, aes(x = reorder(gene, coef), y = coef, fill = coef > 0)) +
+  geom_col(width = 0.7) + coord_flip() +
+  scale_fill_manual(values = c("TRUE"="#D55E00","FALSE"="#0072B2")) +
+  labs(title="LASSO Cox: Selected Coefficients (λ_min)", x="", y="Coefficient (β)") +
+  theme_minimal(base_size = 13)
+
+print(p_lasso)
+ggsave("figures/lasso_coefficients_barplot.png", p_lasso, width = 7, height = 5, dpi = 300)
+```
+
+## Train/test split and test-set evaluation
+
+```{r train-test, fig.width=7, fig.height=6}
+patient_df <- patient_df %>% filter(OS.time > 0)
+set.seed(123)
+events <- patient_df$OS
+train_idx <- unlist(c(
+  sample(which(events == 1), size = floor(sum(events == 1) * 0.7)),
+  sample(which(events == 0), size = floor(sum(events == 0) * 0.7))
+))
+test_idx <- setdiff(1:nrow(patient_df), train_idx)
+train_df <- patient_df[train_idx, ]
+test_df <- patient_df[test_idx, ]
+
+X_train <- as.matrix(train_df %>% select(all_of(genes_used)))
+X_test  <- as.matrix(test_df %>% select(all_of(genes_used)))
+train_df$risk_score <- predict(cvfit, newx = X_train, s = "lambda.min", type = "link")
+test_df$risk_score  <- predict(cvfit, newx = X_test,  s = "lambda.min", type = "link")
+
+# standardize using training stats
+zs_mean <- mean(train_df$risk_score); zs_sd <- sd(train_df$risk_score)
+train_df$score_z <- (train_df$risk_score - zs_mean) / zs_sd
+test_df$score_z  <- (test_df$risk_score  - zs_mean) / zs_sd
+
+test_df <- test_df %>% mutate(risk_group = ntile(score_z, 3),
+                              risk_group = factor(risk_group, labels = c("Low","Mid","High")))
+
+fit_test <- survfit(Surv(OS.time, OS) ~ risk_group, data = test_df)
+g_test <- ggsurvplot(fit_test, data = test_df, pval = TRUE, risk.table = TRUE, censor = FALSE,
+                    palette = c("#2C7BB6","#FFFFBF","#D7191C"),
+                    title = "Test-Set KM by LASSO Risk Score (tertiles)",
+                    xlab = "Days", ylab = "Survival Probability", ggtheme = theme_minimal(base_size=13))
+print(g_test)
+ggsave("figures/KM_test_lasso.png", g_test$plot, width = 7, height = 6, dpi = 300)
+
+c_index_test <- survConcordance(Surv(OS.time, OS) ~ score_z, data = test_df)$concordance
+message("Test-set C-index: ", round(c_index_test, 3))
+```
+
+## Multi-gene prognostic score, KM by tertiles, score distribution and heatmap
+
+```{r multi-score, fig.width=7, fig.height=6}
+# univariate betas
+uni_results <- lapply(genes_used, function(g) {
+  df_g <- patient_df %>% select(patient, OS, OS.time, all_of(g)) %>% filter(!is.na(.[[g]]))
+  if (nrow(df_g) < 10) return(NULL)
+  fit <- coxph(as.formula(paste("Surv(OS.time, OS) ~", g)), data = df_g)
+  tidy(fit, conf.int=TRUE, exponentiate = FALSE) %>% mutate(gene = g)
+}) %>% bind_rows() %>% rename(beta = estimate)
+
+betas <- uni_results %>% select(gene, beta)
+genes_used2 <- betas$gene
+
+expr_mat <- as.matrix(patient_df %>% select(all_of(genes_used2)))
+expr_mat[is.na(expr_mat)] <- 0
+coef_vec <- setNames(betas$beta, betas$gene)[genes_used2]
+score_vec <- as.numeric(expr_mat %*% as.numeric(coef_vec))
+
+patient_scores <- patient_df %>% select(patient, OS, OS.time) %>% mutate(score = score_vec)
+patient_scores <- patient_scores %>% mutate(score_z = (score - mean(score, na.rm=TRUE))/sd(score, na.rm=TRUE),
+                                           score_tertile = ntile(score_z, 3),
+                                           risk_group = factor(score_tertile, labels = c("Low","Mid","High")))
+
+fit_score <- survfit(Surv(OS.time, OS) ~ risk_group, data = patient_scores)
+g_km_score <- ggsurvplot(fit_score, data = patient_scores, pval = TRUE, risk.table = TRUE,
+                         palette = c("#2C7BB6","#FFFFBF","#D7191C"),
+                         title = "KM by Multi-Gene Prognostic Score (tertiles)",
+                         xlab = "Days", ylab = "Survival Probability", ggtheme = theme_minimal(base_size=13))
+print(g_km_score)
+ggsave("figures/KM_multi_gene_score_tertiles.png", g_km_score$plot, width = 7, height = 6, dpi = 300)
+
+p_score_dist <- ggplot(patient_scores, aes(x = score_z, fill = risk_group)) +
+  geom_density(alpha = 0.3) + geom_rug(aes(color = risk_group), alpha = 0.4) +
+  labs(title="Distribution of Multi-Gene Prognostic Score (z)", x="Score (z)") + theme_minimal(base_size=13) +
+  scale_fill_manual(values = c("#2C7BB6","#FFFFBF","#D7191C")) + scale_color_manual(values = c("#2C7BB6","#FFFFBF","#D7191C"))
+print(p_score_dist)
+ggsave("figures/score_distribution.png", p_score_dist, width = 7, height = 4, dpi = 300)
+
+# heatmap ordered by score (genes columns, patients rows)
+heat_mat <- as.matrix(patient_df %>% filter(patient %in% patient_scores$patient) %>% select(all_of(genes_used2)))
+rownames(heat_mat) <- patient_df$patient
+ord <- order(patient_scores$score_z, decreasing = TRUE)
+heat_mat_ord <- heat_mat[ord, , drop=FALSE]
+heat_mat_z <- t(scale(t(heat_mat_ord)))
+heat_mat_z[is.na(heat_mat_z)] <- 0
+
+pheatmap::pheatmap(heat_mat_z[1:min(200,nrow(heat_mat_z)), ], cluster_rows = FALSE, cluster_cols = TRUE,
+                   show_rownames = FALSE, main = "Expression heatmap (ordered by score)",
+                   filename = "figures/heatmap_genes20.png", width = 8, height = 6)
+```
+
+## Example Kaplan–Meier plot for a single gene (median split)
+
+```{r example-km, fig.width=6, fig.height=6}
+km_plot_gene <- function(gene) {
+  df <- expr_long %>% filter(gene == gene) %>% inner_join(surv, by="patient")
+  df_clean <- df %>% group_by(patient) %>% summarise(expr = mean(expr, na.rm=TRUE), OS = first(OS), OS.time = first(OS.time)) %>% filter(!is.na(OS), !is.na(OS.time))
+  med <- median(df_clean$expr, na.rm=TRUE)
+  df_clean <- df_clean %>% mutate(group = ifelse(expr >= med, "High","Low"))
+  fit <- survfit(Surv(OS.time, OS) ~ group, data = df_clean)
+  g <- ggsurvplot(fit, data = df_clean, pval = TRUE, risk.table = TRUE, palette = c("#D55E00","#0072B2"),
+                  title = paste("KM for", gene), xlab = "Days", ylab = "Survival Probability", ggtheme = theme_minimal())
+  return(g)
+}
+g_kras <- km_plot_gene("KRAS")
+print(g_kras)
+ggsave("figures/KM_KRAS_median.png", g_kras$plot, width = 6, height = 6, dpi = 300)
+```
+
+## Short interpretation notes to include in README
+
+Explain the main figures in plain language and place them in `figures/`:
+- `forest_20_genes_pub.png` — hazard ratios from univariate Cox on 20 genes.
+- `lasso_coefficients_barplot.png` — LASSO selected gene coefficients (positive = higher risk).
+- `KM_test_lasso.png` — Kaplan–Meier of test set by tertiles from LASSO risk score.
+- `heatmap_genes20.png` — expression heatmap ordered by multi-gene risk score.
+- `KM_multi_gene_score_tertiles.png` and `score_distribution.png` — multi-gene score evaluation.
+
+You can edit the gene lists, plotting colors, or file names to suit your final GitHub presentation.
+
