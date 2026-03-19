@@ -115,13 +115,6 @@ This project demonstrates:
 	•	Reproducible workflows via R Markdown
 	•	High-quality scientific visualization
 
-Strong for:
-
-✔ Bioinformatics / computational biology job applications
-✔ Genomics / cancer research labs
-✔ Graduate or fellowship applications
-✔ Data science portfolios
-
 ⸻
 
 📝 License
